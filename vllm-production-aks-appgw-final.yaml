@@ -1,0 +1,287 @@
+# =============================================================================
+# vLLM on AKS + Azure Application Gateway (AGIC) + Monitoring
+# Production-oriented baseline
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm
+  labels:
+    app.kubernetes.io/name: vllm
+    pod-security.kubernetes.io/enforce: baseline
+    monitoring: enabled
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-models
+  namespace: vllm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi-premium
+  resources:
+    requests:
+      storage: 500Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-nginx-config
+  namespace: vllm
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+        auth_basic "vLLM API";
+        auth_basic_user_file /etc/nginx/secrets/auth;
+        
+        location = /health {
+            auth_basic off;
+            proxy_pass http://127.0.0.1:8000/health;
+            proxy_set_header Host $host;
+            proxy_connect_timeout 10s;
+            proxy_read_timeout 30s;
+        }
+        
+        location = /metrics {
+            auth_basic off;
+            proxy_pass http://127.0.0.1:8000/metrics;
+            proxy_set_header Host $host;
+        }
+        
+        location / {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_connect_timeout 60s;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            client_max_body_size 50m;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm
+  labels:
+    app: vllm
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/component: inference
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+        app.kubernetes.io/name: vllm
+        app.kubernetes.io/component: inference
+    spec:
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        accelerator: nvidia
+      tolerations:
+        - key: sku
+          operator: Equal
+          value: gpu
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.6.4
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: MODEL_NAME
+              value: "meta-llama/Llama-3.1-8B-Instruct"
+            - name: HF_HOME
+              value: "/root/.cache/huggingface"
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-api-key
+                  key: api-key
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+              optional: true
+          args:
+            - "--model=$(MODEL_NAME)"
+            - "--port=8000"
+            - "--api-key=$(VLLM_API_KEY)"
+            - "--tensor-parallel-size=1"
+            - "--max-model-len=8192"
+            - "--gpu-memory-utilization=0.90"
+            - "--enable-prefix-caching"
+            - "--disable-log-requests"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "12"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 40
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+
+        - name: nginx-auth
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: auth-secret
+              mountPath: /etc/nginx/secrets
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-models
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: nginx-config
+          configMap:
+            name: vllm-nginx-config
+        - name: auth-secret
+          secret:
+            secretName: vllm-basic-auth
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-ingress
+  namespace: vllm
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/request-timeout: "1800"
+    appgw.ingress.kubernetes.io/backend-protocol: "http"
+    appgw.ingress.kubernetes.io/health-probe-path: "/health"
+    appgw.ingress.kubernetes.io/health-probe-port: "8080"
+    appgw.ingress.kubernetes.io/health-probe-status-codes: "200-399"
+    appgw.ingress.kubernetes.io/health-probe-interval: "30"
+    appgw.ingress.kubernetes.io/health-probe-timeout: "30"
+    appgw.ingress.kubernetes.io/health-probe-unhealthy-threshold: "3"
+    appgw.ingress.kubernetes.io/connection-draining: "true"
+    appgw.ingress.kubernetes.io/connection-draining-timeout: "60"
+spec:
+  ingressClassName: azure-application-gateway
+  rules:
+    - host: vllm.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-service
+                port:
+                  number: 80
