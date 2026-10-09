@@ -1,0 +1,138 @@
+# Multi-model CPU server for kind: llama-swap (OpenAI-compatible router) + llama-server.
+# Every model in the catalog appears in /v1/models (and so in Open WebUI); a model is loaded only
+# when selected, and the previously loaded one is unloaded, so only one model sits in RAM at a time.
+# Rendered with envsubst '${VLLM_HOST} ${LLAMA_SWAP_IMAGE} ${CONFIG_SHA}'.
+# The script also creates ConfigMap "llama-models" (models.list + fetch.sh) and Secret "llama-swap-config".
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-model-cache
+  namespace: vllm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+      annotations:
+        checksum/config: "${CONFIG_SHA}"     # changes when the model selection or API key changes -> pod restarts
+    spec:
+      initContainers:
+        - name: fetch-models
+          image: curlimages/curl:8.10.1
+          command: ["/bin/sh", "/scripts/fetch.sh"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - { name: model-cache, mountPath: /models }
+            - { name: scripts,     mountPath: /scripts }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+      containers:
+        - name: llama
+          image: ${LLAMA_SWAP_IMAGE}
+          args: ["-config", "/config/config.yaml", "-listen", ":8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }
+            limits:   { memory: 4Gi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - { name: model-cache, mountPath: /models, readOnly: true }
+            - { name: config,      mountPath: /config,  readOnly: true }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim: { claimName: vllm-model-cache }
+        - name: scripts
+          configMap:
+            name: llama-models
+            items:
+              - { key: models.list, path: models.list }
+              - { key: fetch.sh,    path: fetch.sh }
+        - name: config
+          secret:
+            secretName: llama-swap-config
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Only /v1 and /health are exposed. llama-swap's /ui, /logs and /upstream stay cluster-internal
+# (the logs can contain the llama-server command line, which includes the API key).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-ingress
+  namespace: vllm
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${VLLM_HOST}
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-service
+                port: { number: 80 }
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-service
+                port: { number: 80 }

@@ -1,0 +1,117 @@
+# Fallback backend for CPUs without AVX512 (e.g. t2.large). OpenAI-compatible API,
+# same Service/Ingress names as the vLLM variant. Rendered with envsubst '${VLLM_HOST} ${LLAMA_IMAGE} ${LLAMA_HF_REPO} ${LLAMA_HF_FILE} ${MODEL_ALIAS} ${LLAMA_CTX}'.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-model-cache
+  namespace: vllm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 15Gi       # room for several cached models
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+        - name: llama
+          image: ${LLAMA_IMAGE}
+          # llama.cpp does NOT accept --flag=value; each flag and value is its own argument.
+          args:
+            - "--hf-repo"
+            - "${LLAMA_HF_REPO}"
+            - "--hf-file"
+            - "${LLAMA_HF_FILE}"
+            - "--alias"
+            - "${MODEL_ALIAS}"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--ctx-size"
+            - "${LLAMA_CTX}"
+            - "--api-key"
+            - "$(VLLM_API_KEY)"
+          env:
+            - name: LLAMA_CACHE
+              value: /models
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef: { name: vllm-api-key, key: api-key }
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }   # t2.large has only 2 vCPU; kind system pods use ~1
+            limits:   { memory: 4Gi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: model-cache, mountPath: /models }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim: { claimName: vllm-model-cache }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-ingress
+  namespace: vllm
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${VLLM_HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-service
+                port: { number: 80 }

@@ -1,0 +1,125 @@
+# vLLM CPU backend on kind. Rendered with:
+#   envsubst '${VLLM_HOST} ${MODEL_NAME} ${VLLM_IMAGE}'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-model-cache
+  namespace: vllm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          command: ["vllm", "serve"]
+          args:
+            - "$(MODEL_NAME)"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--api-key=$(VLLM_API_KEY)"
+            - "--dtype=float32"
+            - "--max-model-len=2048"
+            - "--enforce-eager"
+          env:
+            - name: MODEL_NAME
+              value: "${MODEL_NAME}"
+            - name: HF_HOME
+              value: /models
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "1"
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef: { name: vllm-api-key, key: api-key }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: token, optional: true }
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests: { cpu: 500m, memory: 3Gi }    # t2.large has only 2 vCPU; kind system pods use ~1
+            limits:   { memory: 5Gi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - { name: model-cache, mountPath: /models }
+            - { name: shm,         mountPath: /dev/shm }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim: { claimName: vllm-model-cache }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: vllm
+  labels:
+    app: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-ingress
+  namespace: vllm
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${VLLM_HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-service
+                port: { number: 80 }

@@ -1,0 +1,132 @@
+# Open WebUI (browser chat UI) talking to vllm-service inside the cluster.
+# Rendered with: envsubst '${WEBUI_HOST} ${WEBUI_IMAGE} ${INGRESS_CLASS} ${STORAGE_CLASS}'
+# Works on kind (ingress-nginx) and AKS (AGIC): each controller ignores the other's annotations.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-data
+  namespace: vllm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ${STORAGE_CLASS}
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: vllm
+  labels:
+    app: open-webui
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      containers:
+        - name: open-webui
+          image: ${WEBUI_IMAGE}
+          env:
+            - name: OPENAI_API_BASE_URL
+              value: http://vllm-service/v1
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: vllm-api-key, key: api-key }
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: webui-secret, key: secret-key }
+            - name: ENABLE_OLLAMA_API
+              value: "false"
+            - name: ENABLE_SIGNUP
+              value: "true"          # first account created becomes admin; disable afterwards (see README)
+            # Background tasks send extra model calls (with the full prompt) after every message.
+            # On a small CPU they queue up behind the real answer. These apply on first start; for an
+            # existing install, switch them off in Admin Panel > Settings > Interface.
+            - name: ENABLE_TITLE_GENERATION
+              value: "false"
+            - name: ENABLE_TAGS_GENERATION
+              value: "false"
+            - name: ENABLE_FOLLOW_UP_GENERATION
+              value: "false"
+            - name: ENABLE_AUTOCOMPLETE_GENERATION
+              value: "false"
+            # Let every signed-in user see all models. Without this, non-admin users get an empty model
+            # dropdown until an admin grants access per model (Admin Panel > Settings > Models).
+            # Set to "false" if you want per-model / per-group access control.
+            - name: BYPASS_MODEL_ACCESS_CONTROL
+              value: "true"
+            - name: SCARF_NO_ANALYTICS
+              value: "true"
+            - name: DO_NOT_TRACK
+              value: "true"
+            - name: ANONYMIZED_TELEMETRY
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests: { cpu: 100m, memory: 768Mi }
+            limits:   { memory: 2Gi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: data, mountPath: /app/backend/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: open-webui-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: vllm
+  labels:
+    app: open-webui
+spec:
+  selector:
+    app: open-webui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: open-webui
+  namespace: vllm
+  annotations:
+    # ingress-nginx
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Application Gateway (AGIC)
+    appgw.ingress.kubernetes.io/backend-protocol: "http"
+    appgw.ingress.kubernetes.io/health-probe-path: "/health"
+    appgw.ingress.kubernetes.io/request-timeout: "300"
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  rules:
+    - host: ${WEBUI_HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: open-webui
+                port: { number: 80 }
