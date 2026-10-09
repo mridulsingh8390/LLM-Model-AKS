@@ -1,0 +1,89 @@
+# DCGM GPU exporter + ServiceMonitors for kube-prometheus-stack (release name: prometheus).
+# Skip the DCGM DaemonSet if you installed the NVIDIA GPU Operator (it ships its own exporter).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+  labels:
+    app: dcgm-exporter
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: dcgm-exporter
+    spec:
+      nodeSelector:
+        kubernetes.azure.com/agentpool: ${GPU_POOL_NAME}
+      tolerations:
+        - key: sku
+          operator: Equal
+          value: gpu
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: dcgm-exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+          ports:
+            - name: metrics
+              containerPort: 9400
+          securityContext:
+            capabilities:
+              add: ["SYS_ADMIN"]
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+  labels:
+    app: dcgm-exporter
+spec:
+  clusterIP: None
+  selector:
+    app: dcgm-exporter
+  ports:
+    - name: metrics
+      port: 9400
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames: ["vllm"]
+  selector:
+    matchLabels:
+      app: vllm
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
